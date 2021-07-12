@@ -3,12 +3,13 @@ import xarray           as     xr
 import igraph           as     ig
 import brainconn        as     bc
 import leidenalg
+import warnings
 from   frites.utils          import parallel_func
 from   .null_models          import *
 from   tqdm                  import tqdm
 from   .util                 import instantiate_graph, _check_inputs, _unwrap_inputs, \
                                     _reshape_list, _is_binary, _convert_to_affiliation_vector,\
-                                    _modularity_from_partition
+                                    MODquality, CPMquality
 
 _DEFAULT_TYPE = np.float32
 
@@ -38,7 +39,7 @@ def compute_nodes_degree(A, mirror=False):
 
     return node_degree
 
-def compute_nodes_clustering(A, verbose=False, backend='igraph', n_jobs=1):  
+def compute_nodes_clustering(A, verbose=False, backend='igraph', n_jobs=1):
     r'''
     Given the multiplex adjacency matrix A with shape (roi,roi,trials,time), the clustering coefficient for each
     node is computed for all the trials concatenated.
@@ -73,15 +74,15 @@ def compute_nodes_clustering(A, verbose=False, backend='igraph', n_jobs=1):
                 g          = instantiate_graph(A[...,t], is_weighted=is_weighted)
                 clustering = g.transitivity_local_undirected(weights="weight")
             elif backend == 'brainconn':
-                clustering = bc.clustering.clustering_coef_wu(A[...,t])  
+                clustering = bc.clustering.clustering_coef_wu(A[...,t])
         else:
             if backend == 'igraph':
                 g          = instantiate_graph(A[...,t], is_weighted=is_weighted)
                 clustering = g.transitivity_local_undirected()
             elif backend == 'brainconn':
-                clustering = bc.clustering.clustering_coef_bu(A[...,t])  
+                clustering = bc.clustering.clustering_coef_bu(A[...,t])
         return clustering
-    
+
     # define the function to compute in parallel
     parallel, p_fun = parallel_func(
         _for_frame, n_jobs=n_jobs, verbose=verbose,
@@ -128,6 +129,76 @@ def compute_nodes_coreness(A, verbose=False, n_jobs=1):
     def _for_frame(t):
         g        = instantiate_graph(A[...,t], is_weighted=is_weighted)
         coreness = g.coreness()
+        return coreness
+
+    # define the function to compute in parallel
+    parallel, p_fun = parallel_func(
+        _for_frame, n_jobs=n_jobs, verbose=verbose,
+        total=nt)
+    # Compute the single trial coherence
+    coreness = parallel(p_fun(t) for t in range(nt))
+    # Convert to numpy array
+    coreness = np.asarray(coreness).T
+
+    # Unstack trials and time
+    coreness = coreness.reshape( (len(roi),len(trials),len(time)) )
+    # Convert to xarray
+    coreness = xr.DataArray(coreness.astype(_DEFAULT_TYPE), dims=("roi","trials","times"),
+                              coords={"roi": roi, "times": time, "trials": trials} )
+
+    return coreness
+
+def compute_nodes_coreness_bc(A, verbose=False, n_jobs=1):
+    r'''
+    The same as 'compute_nodes_coreness' but based on brainconnectivity toolbox method can be either for binary
+    or weighted undirected graphs.
+    Given the multiplex adjacency matrix A with shape (roi,roi,trials,time), the coreness for each
+    node is computed for all the trials concatenated.
+    > INPUTS:
+    - A: Multiplex adjacency matrix with shape (roi,roi,trials,time).
+    - is_weighted: Scepecify if the network is weighted or binary.
+    - verbose: Wheater to print the progress or not.
+    - n_jobs: Number of jobs to use when parallelizing in observations.
+    > OUTPUTS:
+    - coreness: A matrix containing the nodes coreness with shape (roi,trials,time).
+    '''
+    # Check inputs
+    _check_inputs(A, 4)
+    # Get values in case it is an xarray
+    A, roi, trials, time = _unwrap_inputs(A,concat_trials=True)
+    # Check if the matrix is weighted or binary
+    is_weighted = not _is_binary(A)
+    #  Number of channels
+    nC = A.shape[0]
+    #  Number of observations
+    nt = A.shape[-1]
+    #  Variable to store node coreness
+
+    ##################################################################
+    # Include method for S-core
+    #################################################################
+    def _nodes_kcore_bu(A):
+        # Number of nodes
+        n_nodes = len(A)
+        # Initial coreness
+        k       = 0
+        # Store each node's coreness
+        k_core  = np.zeros(n_nodes)
+        # Iterate until get a disconnected graph
+        while True:
+            # Get coreness matrix and level of k-core
+            C, kn = bc.core.kcore_bu(A,k,peel=False)
+            if kn==0:
+                break
+            # Assigns coreness level to nodes
+            idx = C.sum(1)>0
+            k_core[idx]=k
+            k+=1
+        return k_core+1
+
+    # Compute for a single observation
+    def _for_frame(t):
+        coreness = _nodes_kcore_bu(A[...,t])
         return coreness
 
     # define the function to compute in parallel
@@ -213,7 +284,7 @@ def compute_network_partition(A,  kw_louvain={}, kw_leiden={}, verbose=False, ba
     - is_weighted: Scepecify if the network is weighted or binary.
     - verbose: Wheater to print the progress or not.
     > OUTPUTS:
-    - partition: A list with the all the partition found for each layer of the 
+    - partition: A list with the all the partition found for each layer of the
     matrix (for each observation or trials,time if flatten is False).
     '''
 
@@ -233,139 +304,61 @@ def compute_network_partition(A,  kw_louvain={}, kw_leiden={}, verbose=False, ba
     # Using igraph
     if backend == 'igraph':
         #  Save the partitions
-        partition = np.empty(nt, dtype=object)
-
-        itr = range(nt)
-        for t in (tqdm(itr) if verbose else itr):
-            g          = instantiate_graph(A[:,:,t], is_weighted=is_weighted)
-            # Uses leidenalg
-            if is_weighted: 
-                weights="weight"
-            else: 
-                weights=None
-            partition[t] = leidenalg.find_partition(g, leidenalg.ModularityVertexPartition, weights=weights, **kw_leiden)
-
-        # Convert to affiliation vector
-        partition = _convert_to_affiliation_vector(nC, partition).astype(int)
-        # Reshape back to trials and time
-        partition = np.reshape(partition, (nC,len(trials),len(time)))
-        # Conversion to xarray
-        partition = xr.DataArray(partition, dims=("roi","trials","times"),
-                                 coords={"roi":roi,"trials":trials,"times":time})
-
-        # Reshape back to trials and time
-        #  partition = np.reshape(partition, (len(trials),len(time)))
-        # Conversion to xarray
-        #  partition = xr.DataArray(partition, dims=("trials","times"),
-        #                           coords={"trials":trials,"times":time})
-
-    # Using brainconn
-    elif backend == 'brainconn':
-
-        def _for_frame(t):
-            partition, _  = bc.modularity.modularity_louvain_und(A[...,t], **kw_louvain)
-            return partition-1
-
-        # define the function to compute in parallel
-        parallel, p_fun = parallel_func(
-            _for_frame, n_jobs=n_jobs, verbose=verbose,
-            total=nt)
-
-        # Compute the single trial coherence
-        partition = parallel(p_fun(t) for t in range(nt))
-        partition = np.asarray(partition).T
-
-        # Reshape back to trials and time
-        partition = np.reshape(partition, (nC,len(trials),len(time)))
-        # Conversion to xarray
-        partition = xr.DataArray(partition, dims=("roi","trials","times"),
-                                 coords={"roi":roi,"trials":trials,"times":time})
-
-    return partition
-
-def compute_network_modularity(A, kw_louvain={}, kw_leiden={}, verbose=False, backend='igraph', n_jobs=1):
-    r'''
-    Given the multiplex adjacency matrix A with shape (roi,roi,trials*time), the modularity of the  
-    network for each layer/time is computed for all the trials concatenated.
-    > INPUTS:
-    - A: Multiplex adjacency matrix with shape (roi,roi,trials,time).
-    - kw_louvain: Parameters to be passed to louvain alg for brainconn package (for frther info see: brainconn.readthedocs.io/en/latest/generated/brainconn.modularity.community_louvain.html#brainconn.modularity.community_louvain)
-    - kw_leiden: Parameters to be passed to leindelalg (for frther info see: https://leidenalg.readthedocs.io/en/stable/reference.html)
-    - is_weighted: Scepecify if the network is weighted or binary.
-    - verbose: Wheater to print the progress or not.
-    - backend: Wheter to use igraph or brainconn package.
-    - n_jobs: Number of jobs to use when parallelizing in observations.
-    > OUTPUTS:
-    - modularity: Modularity for each time frame of the temporal network.
-    '''
-
-    assert backend in ['igraph','brainconn']
-
-    # Using igraph
-    if backend == 'igraph':
-        assert n_jobs==1, "n_jobs only allowed for backend brainconn"
-        # Finding parititions
-        if verbose: print("Finding network partitions.\n")
-        partition = compute_network_partition(A, kw_leiden, verbose=verbose,backend='igraph')
-        # Getting dimension arrays
-        trials, time = partition.trials.values, partition.times.values
-        nt           = len(trials)*len(time)
-        # Stack paritions 
-        partition    = partition.stack(observations=("trials","times"))
-
-        #  Variable to store modularity
+        # Store nodes' membership
+        partition = np.zeros((nC,nt))
+        # Store network modularity
         modularity  = np.zeros(nt)
-        # Check if gamma was specified
-        #  if 'gamma' in kw_louvain:
-        #      gamma = kw_louvain['gamma']
-        #  else:
-        #      gamma = 1
-
-        # Stack adjacency 
-        A = A.stack(observations=("trials","times")).values
-        #  print(f'{type(A)=}')
 
         itr = range(nt)
         for t in (tqdm(itr) if verbose else itr):
-            modularity[t] = _modularity_from_partition(A[...,t], partition[...,t].values)
-            #  modularity[t] = partition.values[t].modularity
+            g          = instantiate_graph(A[...,t], is_weighted=is_weighted)
+            # Uses leidenalg
+            if is_weighted:
+                weights="weight"
+            else:
+                weights=None
+
+            optimizer = leidenalg.ModularityVertexPartition
+            # Find partitions
+            partition[:,t]= leidenalg.find_partition(g, optimizer, weights=weights, **kw_leiden).membership
+            # Compute modularity
+            modularity[t] = MODquality(A[...,t],partition[:,t],1)
+
     # Using brainconn
     elif backend == 'brainconn':
-        # Check inputs
-        _check_inputs(A, 4)
-        # Get values in case it is an xarray
-        A, roi, trials, time = _unwrap_inputs(A,concat_trials=True)
-        #  Number of channels
-        nC = A.shape[0]
-        #  Number of observations
-        nt = A.shape[-1]
 
         def _for_frame(t):
-            try:
-                _, modularity = bc.modularity.modularity_louvain_und(A[...,t], **kw_louvain)
-            except:
-                modularity = np.nan
-            return modularity
+            partition, modularity  = bc.modularity.modularity_louvain_und(A[...,t], **kw_louvain)
+            return np.concatenate((partition-1,[modularity]))
+            #  return partition-1, modularity
 
         # define the function to compute in parallel
         parallel, p_fun = parallel_func(
             _for_frame, n_jobs=n_jobs, verbose=verbose,
             total=nt)
+
         # Compute the single trial coherence
-        modularity = parallel(p_fun(t) for t in range(nt))
-        # Convert to numpy array
-        modularity = np.asarray(modularity).T
+        #  partition, modularity = parallel(p_fun(t) for t in range(nt))
+        out = np.squeeze( parallel(p_fun(t) for t in range(nt)) )
+        partition, modularity = np.asarray(out[:,:-1]).T, np.asarray(out[:,-1])
+
+    # Reshape partition and modularity back to trials and time
+    partition = np.reshape(partition, (nC,len(trials),len(time)))
+    # Conversion to xarray
+    partition = xr.DataArray(partition.astype(int), dims=("roi","trials","times"),
+                             coords={"roi":roi,"trials":trials,"times":time})
 
     # Unstack trials and time 
     modularity = modularity.reshape( (len(trials),len(time)) )
     # Convert to xarray
     modularity = xr.DataArray(modularity.astype(_DEFAULT_TYPE), dims=("trials","times"),
                               coords={"times": time, "trials": trials} )
-    return modularity
+
+    return partition, modularity
 
 def compute_allegiance_matrix(A, kw_louvain={}, kw_leiden={}, concat=False, verbose=False, backend='igraph', n_jobs=1):
     r'''
-    Given the multiplex adjacency matrix A with shape (roi,roi,trials*time), the allegiance matrix for  
+    Given the multiplex adjacency matrix A with shape (roi,roi,trials*time), the allegiance matrix for
     the whole period provided will be computed.
     > INPUTS:
     - A: Multiplex adjacency matrix with shape (roi,roi,trials,time).
@@ -394,82 +387,13 @@ def compute_allegiance_matrix(A, kw_louvain={}, kw_leiden={}, concat=False, verb
     if backend == 'igraph':
         assert n_jobs==1, "For backend igraph n_jobs is not allowed" #  
         #  Find the partitions 
-        if verbose: print("Finding network partitions.\n") 
-        p = compute_network_partition(A, kw_leiden, verbose=verbose,backend='igraph')
-        # Getting dimension arrays
-        #  trials, time = p.trials.values, p.times.values
-        # Total number of observations
-        #  nt           = len(trials)*len(time)
-        # Stack paritions 
-        #  p            = p.stack(observations=("trials","times"))
-
-        #  def _for_frame(t):
-        #      # Allegiance for a frame
-        #      T  = np.zeros((nC,nC))
-        #      # Affiliation vector
-        #      av = p.isel(observations=t).values
-        #      # For now convert affiliation vector to igraph format
-        #      n_comm = av.max()+1
-        #      for j in range(n_comm):
-        #          p_lst = np.arange(nC,dtype=int)[av==j]
-        #          grid  = np.meshgrid(p_lst,p_lst)
-        #          grid  = np.reshape(grid, (2, len(p_lst)**2)).T
-        #          T[grid[:,0],grid[:,1]] = 1
-        #      return T
-
-        #  # define the function to compute in parallel
-        #  parallel, p_fun = parallel_func(
-        #      _for_frame, n_jobs=n_jobs, verbose=verbose,
-        #      total=nt)
-        #  # Compute the single trial coherence
-        #  T = parallel(p_fun(t) for t in range(nt))
-        #  T = np.mean(T,0)
-
-        #  T = np.zeros((nC, nC,nt))
-
-        #  itr = range( nt )
-        #  for i in (tqdm(itr) if verbose else itr):
-        #      p_lst  = list(p.values[i])
-        #      n_comm = len(p_lst)
-        #      for j in range(n_comm):
-        #          grid = np.meshgrid(p_lst[j],p_lst[j])
-        #          grid = np.reshape(grid, (2, len(p_lst[j])**2)).T
-        #          T[grid[:,0],grid[:,1],i] += 1
-        #  #  T = T / nt
-        #  T = np.nanmean(T,-1)
+        if verbose: print("Finding network partitions.\n")
+        p,_ = compute_network_partition(A, kw_leiden, verbose=verbose,backend='igraph')
     # Using brainconn
     elif backend == 'brainconn':
         #  Find the partitions
         if verbose: print("Finding network partitions.\n")
-        p = compute_network_partition(A, kw_louvain, verbose=verbose,backend='brainconn',n_jobs=n_jobs)
-        # Getting dimension arrays
-        #  trials, time = p.trials.values, p.times.values
-        # Total number of observations
-        #  nt           = len(trials)*len(time)
-        # Stack paritions 
-        #  p            = p.stack(observations=("trials","times"))
-
-        #  def _for_frame(t):
-        #      # Allegiance for a frame
-        #      T  = np.zeros((nC,nC))
-        #      # Affiliation vector
-        #      av = p.isel(observations=t).values
-        #      # For now convert affiliation vector to igraph format
-        #      n_comm = av.max()+1
-        #      for j in range(n_comm):
-        #          p_lst = np.arange(nC,dtype=int)[av==j]
-        #          grid  = np.meshgrid(p_lst,p_lst)
-        #          grid  = np.reshape(grid, (2, len(p_lst)**2)).T
-        #          T[grid[:,0],grid[:,1]] = 1
-        #      return T
-
-        #  # define the function to compute in parallel
-        #  parallel, p_fun = parallel_func(
-        #      _for_frame, n_jobs=n_jobs, verbose=verbose,
-        #      total=nt)
-        #  # Compute the single trial coherence
-        #  T = parallel(p_fun(t) for t in range(nt))
-        #  T = np.mean(T,0)
+        p,_ = compute_network_partition(A, kw_louvain, verbose=verbose,backend='brainconn',n_jobs=n_jobs)
 
     # Getting dimension arrays
     trials, time = p.trials.values, p.times.values
@@ -484,7 +408,7 @@ def compute_allegiance_matrix(A, kw_louvain={}, kw_leiden={}, concat=False, verb
         # Affiliation vector
         av = p.isel(observations=t).values
         # For now convert affiliation vector to igraph format
-        n_comm = av.max()+1
+        n_comm = int(av.max()+1)
         for j in range(n_comm):
             p_lst = np.arange(nC,dtype=int)[av==j]
             grid  = np.meshgrid(p_lst,p_lst)
@@ -499,7 +423,7 @@ def compute_allegiance_matrix(A, kw_louvain={}, kw_leiden={}, concat=False, verb
         total=nt)
     # Compute the single trial coherence
     T = parallel(p_fun(t) for t in range(nt))
-    T = np.mean(T,0)
+    T = np.nanmean(T,0)
 
     # Converting to xarray
     T = xr.DataArray(T.astype(_DEFAULT_TYPE), dims=("sources","targets"),
@@ -537,7 +461,7 @@ def windowed_allegiance_matrix(A, kw_louvain={}, kw_leiden={}, times=None,  verb
     win, t_win = define_windows(times, **win_args)
     # For a given trial computes windowed allegiance
     def _for_win(trial, win):
-        T = xr.DataArray(np.zeros((nC,nC,len(win))), 
+        T = xr.DataArray(np.zeros((nC,nC,len(win))),
                          dims=("sources","targets","times"),
                          coords={"sources":roi, "targets": roi, "times":t_win})
         for i_w, w in enumerate(win):
@@ -592,5 +516,5 @@ def null_model_statistics(A, f_name, n_stat, n_rewires=1000, seed=0, n_jobs=1,  
 
     # Converting to xarray
     measures = xr.concat(measures, dim='seeds')
-    
+
     return measures

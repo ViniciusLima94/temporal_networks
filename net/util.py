@@ -41,7 +41,7 @@ def _convert_to_affiliation_vector(n_nodes, partitions):
     return av
 
 @nb.jit(nopython=True)
-def _modularity_from_partition(A, av):
+def MODquality(A,av,gamma=1):
     r'''
     Given an affiliation vector compute the modularity of the graph given by A (adapted from brainconn).
     > INPUTS:
@@ -58,11 +58,39 @@ def _modularity_from_partition(A, av):
     # Number of edges
     n_edges = np.sum(d)
     # Initial modularity matrix
-    B       = A - 1 * np.outer(d, d) / n_edges
+    B       = A - gamma * np.outer(d, d) / n_edges
     #  B       = B[av][:, av]
     # Tile affiliation vector
     s       = av.repeat(n_nodes).reshape((-1, n_nodes))#np.tile(av, (n_nodes, 1))
     return np.sum(np.logical_not(s - s.T) * B / n_edges)
+
+#@nb.jit(nopython=True)
+def CPMquality(A,av,gamma=1):
+    r'''
+    Constant Potts Model (CPM) quality function.
+    > INPUTS:
+    - A: Adjacency matrix.
+    - av: Affiliation vector of size (n_nodes) containing the label of the community of each node.
+    - gamma: Value of gamma to use.
+    > OUTPUTS:
+    - H: The quality given by the CPM model.
+    '''
+    av    = av.astype(int)
+    # Total number of communities
+    n_comm = int(np.max(av))+1
+    # Quality index
+    H      = 0
+    for c in range(n_comm):
+        # Find indexes of channels in the commucnit C
+        idx = av==c
+        # Number of nodes in community C
+        n_c = np.sum(idx)
+        H   = H + np.sum(A[np.ix_(av[idx],av[idx])])-gamma*n_c*(n_c-1)/2
+        a =np.sum(A[np.ix_(av[idx],av[idx])])
+        b = n_c*(n_c-1)/2
+        #  print(f'{a=}')
+        #  print(f'{b=}')
+    return H
 
 def _check_inputs(array, dims):
     r'''
@@ -106,7 +134,6 @@ def _unwrap_inputs(array, concat_trials=False):
 def _reshape_list(array, shapes, dtype):
     assert isinstance(shapes, tuple)
     assert isinstance(array,  list)
-    
     idx       = 0
     container = np.zeros(shapes, dtype=dtype)
     for i in range(shapes[0]):
